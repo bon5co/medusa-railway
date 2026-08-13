@@ -85,6 +85,7 @@ ENV NODE_ENV=production \
     MEDUSA_DISABLE_TELEMETRY=1
 
 COPY railway-entrypoint.sh /usr/local/bin/railway-entrypoint.sh
+COPY rotate-admin.js /usr/local/bin/rotate-admin.js
 RUN chmod +x /usr/local/bin/railway-entrypoint.sh
 
 EXPOSE 9000

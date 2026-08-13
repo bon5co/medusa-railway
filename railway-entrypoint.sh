@@ -40,12 +40,8 @@ fi
 
 export MEDUSA_WORKER_MODE="${MEDUSA_WORKER_MODE:-shared}"
 
-# Medusa's CLI posts anonymous usage analytics. On a deploy target this is an
-# outbound call on the critical path of every boot; a local reproduction of
-# `medusa db:migrate` sat at "Running migrations..." with an idle database
-# connection and no progress until it was killed, which is what a blocked
-# outbound request looks like from the outside. UNVERIFIED as the cause -- kept
-# because a deployer's store has no reason to phone anyone at boot either way.
+# Medusa's CLI posts anonymous usage analytics on every invocation. A deployer's
+# store has no reason to phone anyone at boot.
 export MEDUSA_DISABLE_TELEMETRY="${MEDUSA_DISABLE_TELEMETRY:-1}"
 
 # medusa build emits a config that requires 'lib/constants' -- a tsconfig path
@@ -77,6 +73,60 @@ until psql "$DATABASE_URL" -c 'SELECT 1' >/dev/null 2>&1; do
 done
 log "Postgres reachable after ${i} attempts"
 
+# ---------------------------------------------------------------------------
+# Decide how Medusa should negotiate TLS with that Postgres, and say so out loud.
+#
+# This is the single thing that stops a Medusa 2 deploy on Railway dead, and it
+# does so with NO error message at all. `loadDatabaseConfig` builds the driver
+# options from the connection string alone
+# (@medusajs/utils/dist/modules-sdk/load-module-database-config.js):
+#
+#     clientUrl.match(/localhost|127\.0\.0\.1|ssl_mode=(disable|false)|sslmode=(disable)/i)
+#         ? { connection: { ssl: false } }
+#         : { connection: { ssl: { rejectUnauthorized: false } } }
+#
+# Railway's Postgres is reached over the private network at
+# `postgres.railway.internal`, which matches none of those, so Medusa demands
+# TLS from a server that may not offer it. The migration runner then opens its
+# advisory-lock pool with `propagateCreateError: false`
+# (@medusajs/utils/dist/modules-sdk/create-pg-connection.js), which tells tarn to
+# swallow connection-creation failures and retry forever instead of rejecting the
+# acquire. So `medusa db:migrate` prints "Migrations table created successfully",
+# takes no lock, issues no migration SQL, logs nothing further, and reconnects to
+# Postgres several times a second until something kills it. Measured against a
+# non-TLS Postgres: 358 sockets in TIME_WAIT after five minutes, 0 rows in
+# `mikro_orm_migrations`, 0 rows in `pg_locks` for `locktype = 'advisory'`, and
+# the real error only visible after patching that flag to `true` --
+# `Error: The server does not support SSL connections` x25, one per module.
+#
+# The obvious lever, `DATABASE_DRIVER_OPTIONS`, does NOT work here and setting it
+# is a wasted boot: `loadDatabaseConfig` reads it, and then the very next branch
+# (`isModuleServiceInitializeOptions`) overwrites `driverOptions` with
+# `options.database.driverOptions ?? getDefaultDriverOptions(clientUrl)` for any
+# caller that passes a database config -- which the app loader always does.
+# Verified by exporting it and watching the same silent retry loop.
+#
+# So the only lever that reaches the guess is the connection string the guess is
+# made from. `sslmode=disable` is one of the patterns it looks for, it survives
+# the loader's parameter stripping (only `ssl_mode=` is removed), and node-pg
+# honours it as a real connection parameter, so URL and driver options agree.
+# ---------------------------------------------------------------------------
+case "$DATABASE_URL" in
+    *sslmode=*|*ssl_mode=*)
+        log "DATABASE_URL already specifies an sslmode -- leaving it alone" ;;
+    *)
+        if PGSSLMODE=require psql "$DATABASE_URL" -c 'SELECT 1' >/dev/null 2>&1; then
+            log "Postgres accepts TLS -- leaving Medusa's default (ssl, unverified) in place"
+        else
+            case "$DATABASE_URL" in
+                *\?*) DATABASE_URL="${DATABASE_URL}&sslmode=disable" ;;
+                *)    DATABASE_URL="${DATABASE_URL}?sslmode=disable" ;;
+            esac
+            export DATABASE_URL
+            log "Postgres does not offer TLS -- appended sslmode=disable"
+        fi ;;
+esac
+
 FRESH=0
 if ! psql "$DATABASE_URL" -tAc "SELECT to_regclass('public.\"user\"')" 2>/dev/null | grep -q .; then
     FRESH=1
@@ -107,13 +157,24 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Admin user, on every boot. `medusa user` exits non-zero when the account is
-# already there, which is the normal case on a redeploy.
+# Admin account, on every boot -- created on the first, and its password brought
+# back in line with the environment on every one after that.
+#
+# `medusa user` only ever creates: it refuses once the account exists, and there
+# is no update or reset command anywhere in the CLI. So without the second branch
+# the password a deployer sets in Railway's variable panel applies exactly once,
+# and every later edit is silently ignored while the panel shows the new value.
 # ---------------------------------------------------------------------------
-if "$MEDUSA" user -e "$MEDUSA_ADMIN_EMAIL" -p "$MEDUSA_ADMIN_PASSWORD" 2>&1 | tee /tmp/user.log; then
-    log "admin user ensured: $MEDUSA_ADMIN_EMAIL"
+# The query comes in over stdin rather than -c because psql only interpolates
+# :'variables' for scripts, not for -c, and the address must not be pasted into
+# the SQL by hand.
+if printf 'SELECT 1 FROM public."user" WHERE email = :%s AND deleted_at IS NULL LIMIT 1\n' "'email'" \
+        | psql "$DATABASE_URL" -v email="$MEDUSA_ADMIN_EMAIL" -tA -f - 2>/dev/null | grep -q 1; then
+    log "admin account exists -- setting its password from the environment"
+    "$MEDUSA" exec /usr/local/bin/rotate-admin.js
 else
-    log "admin user already present: $MEDUSA_ADMIN_EMAIL"
+    log "creating admin account: $MEDUSA_ADMIN_EMAIL"
+    "$MEDUSA" user -e "$MEDUSA_ADMIN_EMAIL" -p "$MEDUSA_ADMIN_PASSWORD"
 fi
 
 log "starting Medusa ${MEDUSA_VERSION:-2} on port ${PORT:-9000}"
