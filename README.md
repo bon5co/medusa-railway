@@ -1,5 +1,9 @@
 # medusa-railway
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/medusa-2-or-just-updated-headless-commer?referralCode=Z1xivh&utm_medium=integration&utm_source=template&utm_campaign=generic)
+
+**Deploy on Railway:** [Medusa 2 template](https://railway.com/deploy/medusa-2-or-just-updated-headless-commer?referralCode=Z1xivh&utm_medium=integration&utm_source=template&utm_campaign=generic)
+
 Medusa 2.17.2 commerce API + Admin dashboard, prebuilt for Railway.
 
 Image: `ghcr.io/bon5co/medusa-railway:2.17.2`
